@@ -1,0 +1,12 @@
+This shell script aims to be a easy-non-feature-rich but
+fulfilling-all-you-needs distributed renderer for Maya.
+
+Installation:
+
+1. Edit the example-yammy.conf at your needs and copy it to
+   ~/.yammy.conf
+
+2. maybe you want to use a yammyClient file to tell the scrip
+   which hosts should be used for rendering
+
+3. run the yammy script (./yammy)

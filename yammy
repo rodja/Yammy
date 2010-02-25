@@ -1,0 +1,413 @@
+#!/bin/sh
+# Copyright (c) 2004 Rodja Trappe <trappe@uni-koblenz.de>
+# This code is hereby licensed for public consumption under the
+# GNU GPL v2 or greater.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+
+# enabling advanced pattern matching stuff
+shopt -s extglob
+
+VERSION=0.5.6
+
+# Builtin defaults
+
+IMAGES_PER_CLIENT=1
+SECONDS_TO_WAIT_BETWEEN_LOOKING_FOR_CLIENTS=60
+
+START_FRAME=1
+END_FRAME=1
+
+LIST_OF_CLIENTS=
+
+FILE_NAME_PREFIX=yammy
+FILE_TYPE=tif
+IMG_DESTINATION=
+PROJECT=
+SCENE=
+
+LOG_FILE_DEST=.
+LOG_LEVEL=1
+
+DISTRIBUTE_NEW_RENDER_JOBS=true
+
+CONFIG_FILE=$HOME/.yammy.conf
+DYNAMIC_CONFIG_FILE=
+
+GO_FILE_ON_CLIENTS=/tmp/yammy.go
+
+MAX_NUM_OF_PARALLEL_JOBS=-1
+RENDER_JOBS_COUNT=0
+
+# Some helpful functions
+
+usage () {
+	echo "Usage: yammy [options] clients"
+	echo "Options:"
+	echo " -n [num]    num images per client"
+	echo " -s [num]    Start at frame num"
+	echo " -e [num]    Stop at frame num"
+	echo " -T [sec]    Wait sec seconds between \"is client busy\" checks"
+	echo " -d [dest]   Images will be stored in dest"
+	echo " -f [file]   file is taken as prefix of each rendered image"
+	echo " -t [type]   Images are stored with type extension (tif, tga, ...)"
+	echo " -p [proj]   Set the Maya project to proj"
+	echo " -c [cam]    Render with camera cam"
+	echo " -S [scene]  Render scene"
+	echo " -l [path]   Write log files in to directory path"
+	echo " -L [0..4]   Use log level beween 1..4 (0=none, 4=high)"
+	echo " -D [file]   Use file for dynamic config parsing"
+	echo " -C [conf]   Take conf as configuration file"
+	echo " -K          Kill all renderings on the clients"
+	echo " -v          Show version number and exit"
+	echo " -V          Be verbose"
+	echo " -h          This help information"
+}
+
+logMessage () {
+	echo $1
+	echo "$(date +%a-%x-%X) $1" >> $LOG_FILE_DEST/yammy.log
+	return 0
+}
+
+checkImage () {
+	exit $(identify ${IMG_DESTINATION}/${FILE_NAME_PREFIX}.*([0])$1.${FILE_TYPE} > /dev/null 2>&1)
+}
+
+isThereAFreeLicense () {
+
+	# proceed if we should ditribute an other render job
+	! [[ $DISTRIBUTE_NEW_RENDER_JOBS ]] &&	return 1
+
+	# getting licens infos
+	LICENSE_INFO=$(lmstat -f | grep "MayaMRFMf");
+
+	# setting positional parameters to do word splitting (no need for awk)
+	set -- $LICENSE_INFO
+	
+	# check if the number of available licenses is greater then the actual used ones
+	if (( ${6} > ${11} )); then 
+		return 0; # there is a free license
+	else 
+		logMessage "No more licenses available (this is often no problem)."
+		return 1; # there is none
+	fi
+}
+
+killRenderingsOn () {
+	for NAME in $@; do 
+		ssh $NAME -2 -x 'killall Render; killall maya; killall maya.bin; killall MayaBatch' > /dev/null 2>&1
+	done
+	logMessage "Killed renderings on $@"
+}
+
+checkIfClientDied () {
+	
+	[[ -r "${LOG_FILE_DEST}/render-${1}.log" ]] && ( tail -10 ${LOG_FILE_DEST}/render-${1}.log | grep "fatal error" > /dev/null 2>&1 ) && (logMessage "$1 died while rendering.") && (killRenderingsOn ${1})
+}
+
+getStatusOfClient () {
+
+	local CLIENT=$1
+
+	# bulid up query
+	local QUERY="(echo \$ARCH); [[ \$(users) ]] && (echo \"thereIsAnUser \") || (echo \"thereIsNoUser \"); (test -f $GO_FILE_ON_CLIENTS) && (echo \"userWhishsRendering \") || (echo \"userWhishsNoRendering \" ) ; ( ( ps axc  | grep Render )  > /dev/null 2>&1) && (echo \"isRendering\") || (echo \"isNotRendering\")"
+
+	# get a result string as info from the client
+	local RESULT=$(ssh $CLIENT -q -x -2 "$QUERY");
+
+	[ "$BE_VERBOSE" ] && logMessage "Result of status request: \"$RESULT\""
+
+	! [ "$RESULT" ] && (logMessage "$CLIENT is unreachable") && return 1
+
+	# wordsplitting of result
+	set -- $RESULT
+	
+	# save architecture
+	CLIENT_ARCH=${1}
+	
+	# check if we can use the client for rendering
+	[[ ${2} == "thereIsAnUser" ]] && [[ ${3} == "userWhishsNoRendering" ]] && (logMessage "There is somebody working on $CLIENT") && return 1
+
+	# check if there is already a render job and increment render jobs count
+	[[ ${4} == "isRendering" ]] && RENDER_JOBS_COUNT=$(($RENDER_JOBS_COUNT + 1)) && (logMessage "$CLIENT is already Rendering")
+
+	[[ ${4} == "isRendering" ]] && ! (checkIfClientDied $CLIENT) && return 1 # the client can't get a new render job
+
+	# if there are already enough render jobs don't start a new one
+	(( $MAX_NUM_OF_PARALLEL_JOBS != -1 )) && (( $RENDER_JOBS_COUNT >= $MAX_NUM_OF_PARALLEL_JOBS )) && (logMessage "Maximum of parallel render jobs reached") && return 1
+
+	# everything is fine. Client is free for rendering
+	[ $BE_VERBOSE ] && (logMessage "everything is fine for rendering on $CLIENT") 
+	RENDER_JOBS_COUNT=$(($RENDER_JOBS_COUNT + 1)) 
+	return 0
+}
+
+
+# Start of execution
+
+# grabbing config file 
+while getopts C:n:s:e:T:d:f:l:L:t:p:c:S:D:vVhK opt ; do 
+	case "$opt" in
+		C) CONFIG_FILE=$OPTARG ;;
+		*) ;;
+	esac
+done
+
+# Test user defined config file
+if [ -r $CONFIG_FILE ]; then
+	. $CONFIG_FILE
+fi
+
+OPTIND=1
+
+# grab all parameters (will overwrite config file settings)
+while getopts C:n:s:e:T:d:f:l:L:t:p:c:S:D:vVhK opt ; do
+
+	case "$opt" in
+		n) IMAGES_PER_CLIENT=$OPTARG ;;
+		s) START_FRAME=$OPTARG ;;
+		e) END_FRAME=$OPTARG ;;
+		T) SECONDS_TO_WAIT_BETWEEN_LOOKING_FOR_CLIENTS=$OPTARG ;;
+		d) IMG_DESTINATION=$OPTARG ;;
+		f) FILE_NAME_PREFIX=$OPTARG ;; 
+		l) LOG_FILE_DEST=$OPTARG ;;
+		L) LOG_LEVEL=$OPTARG ;;
+		t) FILE_TYPE=$OPTARG ;;
+		p) PROJECT=$OPTARG ;;
+		c) CAMERA=$OPTARG ;;
+		S) SCENE=$OPTARG ;;
+		D) DYNAMIC_CONFIG_FILE=$OPTARG ;;
+		K) KILL_RENDERINGS=true ;;
+		V) BE_VERBOSE=ture ;;
+		v) 
+	      echo "This is yammy v$VERSION."
+		  echo "USAGE: yammy [options] [clients]"
+		  echo "yammy -h for extra help"
+		  exit ;;
+		C) ;;
+		h) usage; exit ;;
+		?) usage; exit ;;
+	 esac
+
+done
+
+shift $(($OPTIND - 1))
+
+if ! [ -w "$DYNAMIC_CONFIG_FILE" ]; then
+
+	# if we have no clients
+	if [ $# = 0 ] && ! [ "$LIST_OF_CLIENTS" ]; then
+		echo "Please give at least one client."
+		usage
+		exit 1
+	fi
+
+fi
+
+# exit if main values are unset
+if ! [ $IMG_DESTINATION ]; then
+	echo "Please give the destination of images."
+	usage
+	exit 1
+fi
+if  ! [ -d $PROJECT ]; then
+	echo "Please give a valid path to your Maya project"
+	usage
+	exit 1
+fi
+if  ! [ -r "${PROJECT}/$SCENE" ]; then
+	echo "Please give valid scene path relative to your project"
+	usage
+	exit 1
+fi
+
+# first build of client list per dynamic config (this is doubled code at the moment)
+if [ -r "$DYNAMIC_CONFIG_FILE" ]; then
+	IFSORIG=$IFS
+	# split only newlines. Don't know any other way to do this...
+	IFS="
+"
+	for LINE in $(cat "$DYNAMIC_CONFIG_FILE"); do
+		if [ ${LINE:0:7} == "CLIENTS" ]; then
+			LIST_OF_CLIENTS=${LINE:8}
+		fi
+	done
+
+	IFS=$IFSORIG
+fi
+
+# if there is a parameter list of clients, forget about all others
+if [ $# -gt 0 ]; then
+	LIST_OF_CLIENTS=
+	DYNAMIC_CONFIG_FILE=
+fi
+
+while [ $# -gt 0 ]; do
+      
+      # appending client to the list
+      LIST_OF_CLIENTS=$(echo $LIST_OF_CLIENTS $1)
+
+      shift      
+done
+
+# check wether to kill listed clients or not
+if [ $KILL_RENDERINGS ]; then 
+	killRenderingsOn "$LIST_OF_CLIENTS" 
+	exit 0
+fi
+
+if [ "$BE_VERBOSE" ]; then
+
+	echo "Log file destination: $LOG_FILE_DEST"
+	echo "Log level: $LOG_LEVEL"
+	echo "Images per client: $IMAGES_PER_CLIENT"
+	echo "Seconds to wait: $SECONDS_TO_WAIT_BETWEEN_LOOKING_FOR_CLIENTS"
+        echo "Start at frame: $START_FRAME"
+	echo "End at frame: $END_FRAME"
+	echo "List of clients: $LIST_OF_CLIENTS"
+	echo "Image destination: $IMG_DESTINATION"
+	echo "File name prefix: $FILE_NAME_PREFIX"
+	echo "File type: $FILE_TYPE"
+	echo "Use project: $PROJECT"
+	echo "Camera: $CAMERA"
+	echo "Scene: $SCENE"
+	echo "Dynamic config file: $DYNAMIC_CONFIG_FILE"
+fi
+
+# start at the first frame
+PACKET_START_FRAME=$START_FRAME
+ 
+# until we call exit in this while: do looping ;)
+while true; do
+
+	echo "Trying to find a free client for scene $SCENE."
+	
+	# setting true, will maybe disabled by the dynamic config file
+	DISTRIBUTE_NEW_RENDER_JOBS=true
+
+	if [ -w "$DYNAMIC_CONFIG_FILE" ]; then
+		IFSORIG=$IFS
+		# split only newlines. Don't know any other way to do this...
+		IFS="
+"
+		for LINE in $(cat "$DYNAMIC_CONFIG_FILE"); do
+			if [ ${LINE:0:7} == "CLIENTS" ]; then
+				LIST_OF_CLIENTS=${LINE:8}
+			elif [ ${LINE:0:32} == "PAUSE_DISTRIBUTION_OF_RENDERJOBS" ]; then
+				DISTRIBUTE_NEW_RENDER_JOBS=
+			elif [ ${LINE:0:24} == "MAX_NUM_OF_PARALLEL_JOBS" ]; then
+				MAX_NUM_OF_PARALLEL_JOBS=${LINE:24}
+			fi
+		done
+		IFS=$IFSORIG
+	fi
+
+	# setting the counter to zero. Will be incremented by getStatusOfClient
+	RENDER_JOBS_COUNT=0
+
+	for CLIENT in $LIST_OF_CLIENTS; do
+
+		# only proceed if we have a license
+		if ! ( isThereAFreeLicense ); then
+			sleep $SECONDS_TO_WAIT_BETWEEN_LOOKING_FOR_CLIENTS
+			continue 2
+		fi
+
+		if getStatusOfClient $CLIENT; then
+
+			PACKET_END_FRAME=$(($PACKET_START_FRAME + $IMAGES_PER_CLIENT -1))
+			(( $PACKET_END_FRAME > $END_FRAME )) && PACKET_END_FRAME=$END_FRAME
+			
+			for (( i=$PACKET_START_FRAME; i <= $END_FRAME; ++i )) do
+				
+				PACKET_START_FRAME=$i
+
+				if ! (checkImage $i); then 
+					[ "$BE_VERBOSE" ] && logMessage "Image $i needs to be rendered.";
+					break # exit loop and process current start frame
+				fi
+
+			done
+
+			# check if there are any images directly after the actual one 
+			# which needs to be renderd
+			for (( i=1; i <= $IMAGES_PER_CLIENT; ++i )) do
+				
+				PACKET_END_FRAME=$(($PACKET_START_FRAME + $i))
+
+				if ! (checkImage $PACKET_END_FRAME); then 
+					[ "$BE_VERBOSE" ] && logMessage "Image $PACKET_END_FRAME needs to be renderd.";					
+				else
+					PACKET_END_FRAME=$(($PACKET_END_FRAME - 1))
+					break # no further images could be added to this render package
+				fi
+
+			done
+
+			# for our mac use special stuff
+			if [ "$CLIENT_ARCH" == "powerpc-macosx" ]; then 
+				# hack: all macs have 2 cpu's ;)
+				COUNT_CPUS="CPU_COUNT=2"
+				# this is cause shrek has maya in sbin *örks*
+				if [ "$CLIENT" == "shrek" ]; then
+					RENDER_PATH="/usr/sbin/"
+				else 
+					RENDER_PATH=
+				fi
+			elif [ "$CLIENT_ARCH" == "intel-linux" ]; then
+				# take nums of CPUS, but maximum is 2 (hack)
+				COUNT_CPUS="CPU_COUNT=\$(cat /proc/cpuinfo | grep processor | wc -l);if (( \$CPU_COUNT > 2)); then CPU_COUNT=2; fi"
+				RENDER_PATH=
+			else
+				logMessage "$CLIENT has unknown architectur: $CLIENT_ARCH."
+				continue # unknown arch
+			fi
+
+			START_NEW_MSG="Starting new job on $CLIENT with image $PACKET_START_FRAME to $PACKET_END_FRAME"
+
+			echo "" >> ${LOG_FILE_DEST}/render-$CLIENT.log
+			echo "$(date +%a-%x-%X) yammy: $START_NEW_MSG" >> ${LOG_FILE_DEST}/render-$CLIENT.log
+			echo "" >> ${LOG_FILE_DEST}/render-$CLIENT.log
+			logMessage "$START_NEW_MSG"
+
+			# compose render command
+			RENDER_COMMAND="$COUNT_CPUS; (nice -19 ${RENDER_PATH}Render -rt \$CPU_COUNT -r mr -rd $IMG_DESTINATION -im $FILE_NAME_PREFIX -fnc 3 -of $FILE_TYPE -s $PACKET_START_FRAME -e $PACKET_END_FRAME -pad 5 -v $LOG_LEVEL -rgb true -alpha true"
+			if [ "$CAMERA" ]; then 
+				RENDER_COMMAND=$(echo "$RENDER_COMMAND -cam $CAMERA")
+			fi
+			RENDER_COMMAND=$(echo "$RENDER_COMMAND -proj $PROJECT $SCENE)")
+
+			echo $RENDER_COMMAND >> ${LOG_FILE_DEST}/render-$CLIENT.log
+			[ "$BE_VERBOSE" ] && logMessage $RENDER_COMMAND
+			ssh $CLIENT -2 -x "$RENDER_COMMAND && echo \"Job completed\" || echo \"Job aboarted\"" >> ${LOG_FILE_DEST}/render-$CLIENT.log 2>&1 &
+			
+			PACKET_START_FRAME=$(($PACKET_END_FRAME + 1))
+
+			# exit this skript if everything is done
+			if (($PACKET_START_FRAME >= $END_FRAME)); then
+				logMessage "All images are send to the clients."
+
+				# do another loop
+				PACKET_START_FRAME=$START_FRAME
+				
+				logMessage "I'll sleep 30 minutes and start again. This makes fun."
+				sleep 30m
+				
+				# go to the outer loop to start again
+				continue 2
+			fi		
+		fi
+
+	done
+
+	# change access rights
+	chmod go+rw $IMG_DESTINATION/* > /dev/null 2&>1
+
+	# wait a miniute before check the clients again
+	sleep $SECONDS_TO_WAIT_BETWEEN_LOOKING_FOR_CLIENTS
+
+done
+
