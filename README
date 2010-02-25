@@ -10,8 +10,8 @@ ssh access.
 
 Installation:
 
-# Edit the example-yammy.conf at your needs and copy it to
-~/.yammy.conf
-# maybe you want to use a yammyClient file to tell the script
-which hosts should be used for rendering
-# run the yammy script (./yammy)
+1. Edit the example-yammy.conf at your needs and copy it to
+   ~/.yammy.conf
+2. maybe you want to use a yammyClient file to tell the script
+   which hosts should be used for rendering
+3. run the yammy script (./yammy)
