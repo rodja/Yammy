@@ -1,12 +1,17 @@
 This shell script aims to be a easy-non-feature-rich but
 fulfilling-all-you-needs distributed renderer for Maya.
 
+It was used to render all frames of the short animation movie
+"Grandma's Attic" (http://www.youtube.com/watch?v=cOrewlEsk9c).
+We had ten floating Maya licenses at University. The script
+takes care of multi-core setup and is controlled via console.
+The render workstations must run Linux or OSX and provide
+ssh access.
+
 Installation:
 
-1. Edit the example-yammy.conf at your needs and copy it to
-   ~/.yammy.conf
-
-2. maybe you want to use a yammyClient file to tell the scrip
-   which hosts should be used for rendering
-
-3. run the yammy script (./yammy)
+# Edit the example-yammy.conf at your needs and copy it to
+~/.yammy.conf
+# maybe you want to use a yammyClient file to tell the script
+which hosts should be used for rendering
+# run the yammy script (./yammy)
